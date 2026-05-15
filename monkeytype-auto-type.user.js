@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Monkeytype Auto-Type Mod by @ja3farr
 // @namespace    ja3farr.monkeytype.mod
-// @version      1.0.0
-// @description  Rainbow mod menu for monkeytype.com — toggle to auto-type the correct letter on any key press.
+// @version      2.0.0
+// @description  Rainbow mod menu for monkeytype.com with Auto, Legit (Manual Space + Helper) and Full Auto (WPM-targeted human-like) modes.
 // @author       @ja3farr
 // @match        https://monkeytype.com/*
 // @match        https://www.monkeytype.com/*
@@ -13,14 +13,36 @@
 (function () {
     'use strict';
 
-    /* ----------------------------- state ----------------------------- */
+    /* =============================================================
+       STATE
+       ============================================================= */
     const STATE = {
-        enabled: false,
+        // mode: 'off' | 'auto' | 'manual-space' | 'helper' | 'full-auto'
+        mode: 'off',
+        // active UI tab: 'auto' | 'legit' | 'fullauto'
+        tab: 'auto',
+
         menuHidden: false,
         keysSent: 0,
+
+        // Auto tab
+        humanize: false,          // adds small random delay before each key
+
+        // Legit / Helper
+        helperMaxPerWord: 1,      // user-configurable
+        helperUsedThisWord: 0,
+        lastActiveWordEl: null,
+
+        // Full Auto
+        fullAutoWpm: 80,
+        fullAutoMistakeRate: 3,   // percent
+        fullAutoNaturalPauses: true,
+        fullAutoTimer: null,
     };
 
-    /* --------------------------- helpers ----------------------------- */
+    /* =============================================================
+       DOM HELPERS
+       ============================================================= */
     function getWordsContainer() {
         return document.querySelector('#words');
     }
@@ -33,8 +55,6 @@
 
     function getWordText(wordEl) {
         if (!wordEl) return '';
-        // Only count original letters (not the "extra" letters monkeytype appends
-        // when the user over-types).
         const letters = wordEl.querySelectorAll(':scope > letter:not(.extra)');
         let out = '';
         for (const l of letters) out += l.textContent;
@@ -43,9 +63,15 @@
 
     function getTypedLength(wordEl) {
         if (!wordEl) return 0;
-        // Letters that have already been processed by monkeytype either
-        // got marked correct or incorrect.
-        return wordEl.querySelectorAll(':scope > letter.correct, :scope > letter.incorrect').length;
+        return wordEl.querySelectorAll(
+            ':scope > letter.correct, :scope > letter.incorrect'
+        ).length;
+    }
+
+    function isWordComplete(wordEl) {
+        if (!wordEl) return false;
+        const text = getWordText(wordEl);
+        return getTypedLength(wordEl) >= text.length;
     }
 
     function getNextChar() {
@@ -57,20 +83,20 @@
         return word[typed];
     }
 
-    // Cached native value setter — required so React/Solid input handlers see
-    // the change. Setting `wi.value = ...` directly is skipped by the
-    // framework's value tracker.
+    function getInputField() {
+        return document.querySelector('#wordsInput');
+    }
+
+    /* =============================================================
+       INPUT DISPATCH
+       ============================================================= */
     const NATIVE_TEXTAREA_VALUE = Object.getOwnPropertyDescriptor(
         HTMLTextAreaElement.prototype, 'value'
     ).set;
 
     function dispatchKey(ch) {
-        // Monkeytype's real input pipeline is driven by `input` events on
-        // #wordsInput (it ignores untrusted keydowns). Drive that path
-        // directly: focus the textarea, mutate value via the native setter,
-        // and fire a real-looking InputEvent.
-        const wi = document.querySelector('#wordsInput');
-        if (!wi) return;
+        const wi = getInputField();
+        if (!wi) return false;
         if (document.activeElement !== wi) wi.focus();
 
         NATIVE_TEXTAREA_VALUE.call(wi, (wi.value || '') + ch);
@@ -80,48 +106,284 @@
             bubbles: true,
             cancelable: true,
         }));
+        return true;
     }
 
-    /* --------------------- key interception -------------------------- */
-    // Capture-phase, top priority. Stops the user's key from reaching
-    // monkeytype, then sends the *correct* character instead.
-    function onKeyDownCapture(e) {
-        if (!STATE.enabled) return;
-        // Don't swallow shortcuts (Ctrl+R restart, Tab+Enter, Esc, etc).
-        if (e.ctrlKey || e.metaKey || e.altKey) return;
+    function dispatchBackspace() {
+        const wi = getInputField();
+        if (!wi) return false;
+        if (document.activeElement !== wi) wi.focus();
 
-        const k = e.key;
-        // Only intercept printable single-character keys and Space.
-        if (k.length !== 1) return;
+        const v = wi.value || '';
+        if (v.length === 0) return false;
 
-        // No active test, let key through (e.g. typing in command palette).
-        const active = getActiveWord();
-        if (!active) return;
+        NATIVE_TEXTAREA_VALUE.call(wi, v.slice(0, -1));
+        wi.dispatchEvent(new InputEvent('input', {
+            inputType: 'deleteContentBackward',
+            bubbles: true,
+            cancelable: true,
+        }));
+        return true;
+    }
 
-        // If focus is in some OTHER editable element, bail so we don't
-        // hijack the address bar / search inputs / settings.
+    /* QWERTY neighbour map for realistic typos */
+    const NEIGHBORS = {
+        a: 'qwsz', b: 'vghn', c: 'xdfv', d: 'serfcx', e: 'wrsdf',
+        f: 'drtgvc', g: 'ftyhbv', h: 'gyujnb', i: 'ujko', j: 'huikm',
+        k: 'jiolm', l: 'kop', m: 'njk', n: 'bhjm', o: 'iklp',
+        p: 'ol', q: 'wa', r: 'edft', s: 'awdxz', t: 'rfgy',
+        u: 'yhji', v: 'cfgb', w: 'qase', x: 'zsdc', y: 'tghu',
+        z: 'asx',
+    };
+    function neighborKey(ch) {
+        if (!ch || ch.length !== 1) return ch;
+        const lower = ch.toLowerCase();
+        const opts = NEIGHBORS[lower];
+        if (!opts) return ch;
+        const out = opts[Math.floor(Math.random() * opts.length)];
+        return ch === ch.toUpperCase() && /[a-z]/.test(lower) ? out.toUpperCase() : out;
+    }
+
+    /* =============================================================
+       KEY INTERCEPTION (Auto / Manual-Space / Helper modes)
+       ============================================================= */
+    function shouldIgnoreEvent(e) {
+        if (e.ctrlKey || e.metaKey || e.altKey) return true;
+        if (e.key.length !== 1) return true;
         const ae = document.activeElement;
         if (ae && ae !== document.body
               && ae.id !== 'wordsInput'
               && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA' || ae.isContentEditable)) {
+            return true;
+        }
+        return false;
+    }
+
+    function onKeyDownCapture(e) {
+        const mode = STATE.mode;
+        if (mode === 'off' || mode === 'full-auto') return;
+        if (shouldIgnoreEvent(e)) return;
+
+        const active = getActiveWord();
+        if (!active) return;
+
+        if (mode === 'auto') {
+            const next = getNextChar();
+            if (next == null) return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            if (STATE.humanize) {
+                const ms = 4 + Math.random() * 18;
+                setTimeout(() => {
+                    if (STATE.mode !== 'auto') return;
+                    dispatchKey(next);
+                    STATE.keysSent++;
+                    updateCounter();
+                }, ms);
+            } else {
+                dispatchKey(next);
+                STATE.keysSent++;
+                updateCounter();
+            }
+            return;
+        }
+
+        if (mode === 'manual-space') {
+            // Reset helper-style counter on word change isn't needed; manual-space
+            // simply does not auto-advance: when the active word is fully typed,
+            // we let real keys through so the user must press space themselves.
+            if (isWordComplete(active)) {
+                // Word is finished — do not intercept anything. If the user hits
+                // a letter they get a red "extra" mistake; pressing space advances.
+                return;
+            }
+            const next = getNextChar();
+            if (next == null || next === ' ') return;
+            e.preventDefault();
+            e.stopImmediatePropagation();
+            dispatchKey(next);
+            STATE.keysSent++;
+            updateCounter();
+            return;
+        }
+
+        if (mode === 'helper') {
+            if (active !== STATE.lastActiveWordEl) {
+                STATE.lastActiveWordEl = active;
+                STATE.helperUsedThisWord = 0;
+            }
+            const next = getNextChar();
+            if (next == null) return;
+
+            // Don't touch backspace / space / shortcut keys (already filtered).
+            // If the user's key matches the expected letter, let it through —
+            // monkeytype sees the user's natural keystroke.
+            if (e.key === next) return;
+
+            // User pressed space themselves — let it through (skip or advance).
+            if (e.key === ' ') return;
+
+            // Wrong key. If we still have correction budget, silently substitute.
+            if (STATE.helperUsedThisWord < STATE.helperMaxPerWord) {
+                e.preventDefault();
+                e.stopImmediatePropagation();
+                dispatchKey(next);
+                STATE.helperUsedThisWord++;
+                STATE.keysSent++;
+                updateCounter();
+                renderHelperRemaining();
+            }
+            // Otherwise: let the wrong key through (becomes a real mistake).
+            return;
+        }
+    }
+    document.addEventListener('keydown', onKeyDownCapture, true);
+
+    /* =============================================================
+       FULL AUTO MODE
+       ============================================================= */
+    function startFullAuto() {
+        stopFullAuto();
+        const wi = getInputField();
+        if (wi) wi.focus();
+        scheduleFullAuto(250 + Math.random() * 400);
+    }
+
+    function stopFullAuto() {
+        if (STATE.fullAutoTimer) {
+            clearTimeout(STATE.fullAutoTimer);
+            STATE.fullAutoTimer = null;
+        }
+    }
+
+    function scheduleFullAuto(ms) {
+        if (STATE.mode !== 'full-auto') return;
+        if (STATE.fullAutoTimer) clearTimeout(STATE.fullAutoTimer);
+        STATE.fullAutoTimer = setTimeout(fullAutoTick, Math.max(15, ms));
+    }
+
+    function fullAutoBaseDelay() {
+        const wpm = Math.max(5, Math.min(400, STATE.fullAutoWpm || 80));
+        return 12000 / wpm; // ms per char (5 chars/word standard)
+    }
+
+    function fullAutoTick() {
+        if (STATE.mode !== 'full-auto') return;
+
+        const active = getActiveWord();
+        if (!active) {
+            // No active test — keep polling at a slow rate.
+            scheduleFullAuto(400);
             return;
         }
 
         const next = getNextChar();
-        if (next == null) return;
+        if (next == null) {
+            scheduleFullAuto(200);
+            return;
+        }
 
-        // Block original key, then inject the correct one.
-        e.preventDefault();
-        e.stopImmediatePropagation();
+        const wi = getInputField();
+        if (wi && document.activeElement !== wi) wi.focus();
 
-        dispatchKey(next);
-        STATE.keysSent += 1;
-        updateCounter();
+        const base = fullAutoBaseDelay();
+        // Jitter: log-normal-ish via base * (0.65 + r * 0.9)
+        let delay = base * (0.65 + Math.random() * 0.9);
+
+        // Word-boundary pause feels natural
+        if (next === ' ') delay *= 1.25 + Math.random() * 0.4;
+
+        // Occasional "thinking" pause every now and then
+        if (STATE.fullAutoNaturalPauses && Math.random() < 0.05) {
+            delay += 250 + Math.random() * 600;
+        }
+
+        const mistakeChance = Math.max(0, Math.min(0.25, (STATE.fullAutoMistakeRate || 0) / 100));
+        const canMistype = next !== ' ' && /^[a-zA-Z]$/.test(next);
+
+        if (canMistype && Math.random() < mistakeChance) {
+            const wrong = neighborKey(next);
+            const wrongCh = wrong === next ? next : wrong;
+            const noticeDelay = 70 + Math.random() * 140;
+            const correctDelay = 60 + Math.random() * 110;
+
+            setTimeout(() => {
+                if (STATE.mode !== 'full-auto') return;
+                dispatchKey(wrongCh);
+                STATE.keysSent++;
+                updateCounter();
+                setTimeout(() => {
+                    if (STATE.mode !== 'full-auto') return;
+                    dispatchBackspace();
+                    setTimeout(() => {
+                        if (STATE.mode !== 'full-auto') return;
+                        dispatchKey(next);
+                        STATE.keysSent++;
+                        updateCounter();
+                        scheduleFullAuto(delay);
+                    }, correctDelay);
+                }, noticeDelay);
+            }, Math.max(15, delay));
+            return;
+        }
+
+        setTimeout(() => {
+            if (STATE.mode !== 'full-auto') return;
+            dispatchKey(next);
+            STATE.keysSent++;
+            updateCounter();
+            scheduleFullAuto(delay);
+        }, Math.max(15, delay));
     }
 
-    document.addEventListener('keydown', onKeyDownCapture, true);
+    /* =============================================================
+       MODE / SETTINGS
+       ============================================================= */
+    function setMode(newMode) {
+        const prev = STATE.mode;
+        if (prev === newMode) return;
+        STATE.mode = newMode;
+        if (newMode !== 'helper') {
+            STATE.helperUsedThisWord = 0;
+            STATE.lastActiveWordEl = null;
+        }
+        if (newMode === 'full-auto') startFullAuto();
+        else if (prev === 'full-auto') stopFullAuto();
+        renderState();
+        saveSettings();
+    }
 
-    /* ----------------------------- UI -------------------------------- */
+    const SETTINGS_KEY = 'ja3farr-mod-settings';
+    function saveSettings() {
+        try {
+            localStorage.setItem(SETTINGS_KEY, JSON.stringify({
+                tab: STATE.tab,
+                humanize: STATE.humanize,
+                helperMaxPerWord: STATE.helperMaxPerWord,
+                fullAutoWpm: STATE.fullAutoWpm,
+                fullAutoMistakeRate: STATE.fullAutoMistakeRate,
+                fullAutoNaturalPauses: STATE.fullAutoNaturalPauses,
+            }));
+        } catch (e) { /* ignore */ }
+    }
+
+    function loadSettings() {
+        try {
+            const raw = localStorage.getItem(SETTINGS_KEY);
+            if (!raw) return;
+            const d = JSON.parse(raw);
+            if (d.tab) STATE.tab = d.tab;
+            if (typeof d.humanize === 'boolean') STATE.humanize = d.humanize;
+            if (typeof d.helperMaxPerWord === 'number') STATE.helperMaxPerWord = d.helperMaxPerWord;
+            if (typeof d.fullAutoWpm === 'number') STATE.fullAutoWpm = d.fullAutoWpm;
+            if (typeof d.fullAutoMistakeRate === 'number') STATE.fullAutoMistakeRate = d.fullAutoMistakeRate;
+            if (typeof d.fullAutoNaturalPauses === 'boolean') STATE.fullAutoNaturalPauses = d.fullAutoNaturalPauses;
+        } catch (e) { /* ignore */ }
+    }
+
+    /* =============================================================
+       UI
+       ============================================================= */
     const CSS = `
     @keyframes ja3farr-rainbow {
         0%   { background-position:   0% 50%; }
@@ -142,7 +404,7 @@
         top: 90px;
         right: 22px;
         z-index: 2147483647;
-        width: 260px;
+        width: 286px;
         padding: 2px;
         border-radius: 14px;
         background: linear-gradient(120deg,
@@ -156,23 +418,23 @@
         cursor: default;
     }
     #ja3farr-menu .ja3farr-inner {
-        background: rgba(12, 12, 18, 0.92);
+        background: rgba(12, 12, 18, 0.94);
         backdrop-filter: blur(6px);
         -webkit-backdrop-filter: blur(6px);
         border-radius: 12px;
-        padding: 12px 14px 14px;
+        padding: 10px 12px 12px;
     }
     #ja3farr-menu .ja3farr-header {
         display: flex;
         align-items: center;
         justify-content: space-between;
-        margin-bottom: 10px;
+        margin-bottom: 8px;
         cursor: grab;
     }
     #ja3farr-menu .ja3farr-title {
         font-weight: 800;
         letter-spacing: 1.5px;
-        font-size: 13px;
+        font-size: 12px;
         background: linear-gradient(90deg, #ff004c, #ffe600, #00ff85, #00cfff, #ff00d4, #ff004c);
         background-size: 300% 100%;
         animation: ja3farr-rainbow 4s linear infinite;
@@ -198,13 +460,44 @@
     }
     #ja3farr-menu .ja3farr-close:hover { opacity: 1; }
 
+    #ja3farr-menu .ja3farr-tabs {
+        display: flex;
+        gap: 4px;
+        background: rgba(255,255,255,0.04);
+        border: 1px solid rgba(255,255,255,0.06);
+        padding: 3px;
+        border-radius: 10px;
+        margin-bottom: 8px;
+    }
+    #ja3farr-menu .ja3farr-tab {
+        flex: 1;
+        text-align: center;
+        font-size: 10.5px;
+        letter-spacing: 0.8px;
+        padding: 6px 4px;
+        border-radius: 8px;
+        cursor: pointer;
+        opacity: 0.6;
+        text-transform: uppercase;
+        transition: opacity .15s, background .15s;
+    }
+    #ja3farr-menu .ja3farr-tab:hover { opacity: 0.85; }
+    #ja3farr-menu .ja3farr-tab.active {
+        opacity: 1;
+        background: linear-gradient(90deg, #ff004c, #ffe600, #00ff85, #00cfff, #ff00d4);
+        background-size: 200% 100%;
+        animation: ja3farr-rainbow 5s linear infinite;
+        color: #0c0c12;
+        font-weight: 800;
+    }
+
     #ja3farr-menu .ja3farr-row {
         display: flex;
         align-items: center;
         justify-content: space-between;
         gap: 10px;
-        padding: 8px 10px;
-        margin-top: 8px;
+        padding: 7px 10px;
+        margin-top: 6px;
         border-radius: 10px;
         background: rgba(255,255,255,0.04);
         border: 1px solid rgba(255,255,255,0.06);
@@ -219,7 +512,22 @@
         margin-top: 1px;
     }
 
-    /* toggle switch */
+    #ja3farr-menu .ja3farr-legit-meter {
+        display: inline-block;
+        font-size: 9px;
+        padding: 1px 6px;
+        border-radius: 999px;
+        margin-left: 6px;
+        background: rgba(78, 255, 154, 0.18);
+        color: #4eff9a;
+        vertical-align: 1px;
+        letter-spacing: 0.5px;
+    }
+    #ja3farr-menu .ja3farr-legit-meter.lvl-1 { background: rgba(255,200,0,0.15); color: #ffd84e; }
+    #ja3farr-menu .ja3farr-legit-meter.lvl-2 { background: rgba(0,200,255,0.15); color: #4ecbff; }
+    #ja3farr-menu .ja3farr-legit-meter.lvl-3 { background: rgba(78, 255, 154, 0.18); color: #4eff9a; }
+    #ja3farr-menu .ja3farr-legit-meter.lvl-x { background: rgba(255, 78, 106, 0.18); color: #ff7e90; }
+
     #ja3farr-menu .ja3farr-switch {
         position: relative;
         width: 46px;
@@ -241,15 +549,28 @@
         transition: transform .25s, background .25s;
         box-shadow: 0 1px 4px rgba(0,0,0,.4);
     }
-    #ja3farr-menu.is-on .ja3farr-switch {
+    #ja3farr-menu .ja3farr-switch.is-on {
         background: linear-gradient(90deg, #ff004c, #ffe600, #00ff85, #00cfff, #ff00d4);
         background-size: 200% 100%;
         animation: ja3farr-rainbow 3s linear infinite;
     }
-    #ja3farr-menu.is-on .ja3farr-switch::after {
+    #ja3farr-menu .ja3farr-switch.is-on::after {
         transform: translateX(22px);
         background: #fff;
     }
+
+    #ja3farr-menu .ja3farr-num {
+        width: 60px;
+        background: rgba(0,0,0,0.4);
+        border: 1px solid rgba(255,255,255,.12);
+        color: #fff;
+        font-family: inherit;
+        font-size: 12px;
+        padding: 4px 8px;
+        border-radius: 6px;
+        text-align: right;
+    }
+    #ja3farr-menu .ja3farr-num:focus { outline: 1px solid #00cfff; }
 
     #ja3farr-menu .ja3farr-status {
         margin-top: 10px;
@@ -257,7 +578,7 @@
         font-size: 11px;
         letter-spacing: 0.6px;
         text-transform: uppercase;
-        opacity: 0.8;
+        opacity: 0.85;
     }
     #ja3farr-menu .ja3farr-status .ja3farr-dot {
         display: inline-block;
@@ -269,15 +590,14 @@
         box-shadow: 0 0 6px currentColor;
     }
     #ja3farr-menu.is-on .ja3farr-status .ja3farr-dot { background: #4eff9a; }
-
     #ja3farr-menu .ja3farr-counter {
         font-variant-numeric: tabular-nums;
         margin-left: 6px;
-        opacity: .55;
+        opacity: .65;
     }
 
     #ja3farr-menu .ja3farr-credit {
-        margin-top: 10px;
+        margin-top: 9px;
         text-align: center;
         font-size: 10px;
         letter-spacing: 1.5px;
@@ -294,7 +614,6 @@
         letter-spacing: 0.5px;
     }
 
-    /* tiny "show menu" pill, visible when the panel is hidden */
     #ja3farr-show {
         position: fixed;
         top: 90px;
@@ -319,6 +638,85 @@
         document.head.appendChild(s);
     }
 
+    /* ------------- panels per tab ------------- */
+    function panelAutoHtml() {
+        return `
+            <div class="ja3farr-row" data-row="auto">
+                <div>
+                    <div class="ja3farr-label">Auto-Type <span class="ja3farr-legit-meter lvl-x">RISKY</span></div>
+                    <div class="ja3farr-sub">Any key &rarr; correct letter, 100% accuracy</div>
+                </div>
+                <div class="ja3farr-switch" data-toggle="auto"></div>
+            </div>
+            <div class="ja3farr-row" data-row="humanize">
+                <div>
+                    <div class="ja3farr-label">Humanize Delay</div>
+                    <div class="ja3farr-sub">Tiny random delay per key (4&ndash;22ms)</div>
+                </div>
+                <div class="ja3farr-switch" data-toggle="humanize"></div>
+            </div>
+        `;
+    }
+
+    function panelLegitHtml() {
+        return `
+            <div class="ja3farr-row" data-row="manual-space">
+                <div>
+                    <div class="ja3farr-label">Manual Space <span class="ja3farr-legit-meter lvl-1">~40% LEGIT</span></div>
+                    <div class="ja3farr-sub">Auto letters, but YOU press space each word</div>
+                </div>
+                <div class="ja3farr-switch" data-toggle="manual-space"></div>
+            </div>
+            <div class="ja3farr-row" data-row="helper">
+                <div>
+                    <div class="ja3farr-label">Small Helper <span class="ja3farr-legit-meter lvl-3">~90% LEGIT</span></div>
+                    <div class="ja3farr-sub">Type normally, helper fixes <span id="ja3farr-helper-n">1</span> mistake/word</div>
+                </div>
+                <div class="ja3farr-switch" data-toggle="helper"></div>
+            </div>
+            <div class="ja3farr-row" data-row="helper-cfg">
+                <div>
+                    <div class="ja3farr-label">Mistakes Fixed / Word</div>
+                    <div class="ja3farr-sub"><span id="ja3farr-helper-rem">budget: --</span></div>
+                </div>
+                <input class="ja3farr-num" type="number" min="0" max="20" step="1" data-input="helper-max">
+            </div>
+        `;
+    }
+
+    function panelFullAutoHtml() {
+        return `
+            <div class="ja3farr-row" data-row="fullauto">
+                <div>
+                    <div class="ja3farr-label">Full Auto <span class="ja3farr-legit-meter lvl-2">WPM-LEGIT</span></div>
+                    <div class="ja3farr-sub">Types at target WPM with human-like timing</div>
+                </div>
+                <div class="ja3farr-switch" data-toggle="full-auto"></div>
+            </div>
+            <div class="ja3farr-row" data-row="wpm">
+                <div>
+                    <div class="ja3farr-label">Target WPM</div>
+                    <div class="ja3farr-sub">5&ndash;400</div>
+                </div>
+                <input class="ja3farr-num" type="number" min="5" max="400" step="1" data-input="wpm">
+            </div>
+            <div class="ja3farr-row" data-row="mistake">
+                <div>
+                    <div class="ja3farr-label">Mistake Rate %</div>
+                    <div class="ja3farr-sub">Typos + auto-correct (0&ndash;25)</div>
+                </div>
+                <input class="ja3farr-num" type="number" min="0" max="25" step="0.5" data-input="mistake">
+            </div>
+            <div class="ja3farr-row" data-row="pauses">
+                <div>
+                    <div class="ja3farr-label">Natural Pauses</div>
+                    <div class="ja3farr-sub">Occasional "thinking" gaps</div>
+                </div>
+                <div class="ja3farr-switch" data-toggle="pauses"></div>
+            </div>
+        `;
+    }
+
     function buildMenu() {
         const root = document.createElement('div');
         root.id = 'ja3farr-menu';
@@ -329,13 +727,13 @@
                     <div class="ja3farr-close" title="Hide (Shift+M)">&times;</div>
                 </div>
 
-                <div class="ja3farr-row">
-                    <div>
-                        <div class="ja3farr-label">Auto-Type</div>
-                        <div class="ja3farr-sub">Any key &rarr; correct letter</div>
-                    </div>
-                    <div class="ja3farr-switch" id="ja3farr-toggle"></div>
+                <div class="ja3farr-tabs">
+                    <div class="ja3farr-tab" data-tab="auto">Auto</div>
+                    <div class="ja3farr-tab" data-tab="legit">Legit</div>
+                    <div class="ja3farr-tab" data-tab="fullauto">Full Auto</div>
                 </div>
+
+                <div id="ja3farr-panel"></div>
 
                 <div class="ja3farr-status">
                     <span class="ja3farr-dot"></span><span id="ja3farr-state-text">disabled</span>
@@ -354,14 +752,15 @@
         show.style.display = 'none';
         document.body.appendChild(show);
 
-        // ---- behaviour ----
-        const toggle = root.querySelector('#ja3farr-toggle');
-        toggle.addEventListener('click', () => setEnabled(!STATE.enabled));
-
         root.querySelector('.ja3farr-close').addEventListener('click', () => setMenuHidden(true));
         show.addEventListener('click', () => setMenuHidden(false));
 
-        // dragging
+        // Tabs
+        root.querySelectorAll('.ja3farr-tab').forEach(el => {
+            el.addEventListener('click', () => setTab(el.dataset.tab));
+        });
+
+        // Drag
         const drag = root.querySelector('#ja3farr-drag');
         let dragData = null;
         drag.addEventListener('mousedown', (e) => {
@@ -385,25 +784,99 @@
             dragData = null;
         });
 
-        // hotkey: Shift+M to toggle menu visibility
+        // Shift+M hotkey
         document.addEventListener('keydown', (e) => {
             if (e.shiftKey && !e.ctrlKey && !e.altKey && !e.metaKey
                 && (e.key === 'M' || e.key === 'm')) {
-                // only swallow when not focused in a real input
                 const ae = document.activeElement;
                 if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA') && ae.id !== 'wordsInput') return;
                 setMenuHidden(!STATE.menuHidden);
                 e.preventDefault();
             }
         }, true);
+
+        renderPanel();
+        renderState();
     }
 
-    function setEnabled(on) {
-        STATE.enabled = !!on;
+    function renderPanel() {
+        const panel = document.getElementById('ja3farr-panel');
+        if (!panel) return;
+        if (STATE.tab === 'auto') panel.innerHTML = panelAutoHtml();
+        else if (STATE.tab === 'legit') panel.innerHTML = panelLegitHtml();
+        else panel.innerHTML = panelFullAutoHtml();
+
+        // Wire up toggles
+        panel.querySelectorAll('[data-toggle]').forEach(el => {
+            el.addEventListener('click', () => onToggle(el.dataset.toggle));
+        });
+
+        // Wire up inputs
+        panel.querySelectorAll('[data-input]').forEach(el => {
+            el.addEventListener('change', () => onInput(el.dataset.input, el.value));
+            el.addEventListener('input', () => onInput(el.dataset.input, el.value));
+        });
+
+        renderState();
+    }
+
+    function onToggle(name) {
+        if (name === 'auto') {
+            setMode(STATE.mode === 'auto' ? 'off' : 'auto');
+        } else if (name === 'humanize') {
+            STATE.humanize = !STATE.humanize;
+            saveSettings();
+            renderState();
+        } else if (name === 'manual-space') {
+            setMode(STATE.mode === 'manual-space' ? 'off' : 'manual-space');
+        } else if (name === 'helper') {
+            setMode(STATE.mode === 'helper' ? 'off' : 'helper');
+        } else if (name === 'full-auto') {
+            setMode(STATE.mode === 'full-auto' ? 'off' : 'full-auto');
+        } else if (name === 'pauses') {
+            STATE.fullAutoNaturalPauses = !STATE.fullAutoNaturalPauses;
+            saveSettings();
+            renderState();
+        }
+    }
+
+    function onInput(name, value) {
+        const num = parseFloat(value);
+        if (name === 'helper-max') {
+            if (!Number.isFinite(num)) return;
+            STATE.helperMaxPerWord = Math.max(0, Math.min(20, Math.floor(num)));
+        } else if (name === 'wpm') {
+            if (!Number.isFinite(num)) return;
+            STATE.fullAutoWpm = Math.max(5, Math.min(400, Math.round(num)));
+        } else if (name === 'mistake') {
+            if (!Number.isFinite(num)) return;
+            STATE.fullAutoMistakeRate = Math.max(0, Math.min(25, num));
+        }
+        saveSettings();
+        renderState();
+    }
+
+    function renderHelperRemaining() {
+        const el = document.getElementById('ja3farr-helper-rem');
+        if (!el) return;
+        const rem = Math.max(0, STATE.helperMaxPerWord - STATE.helperUsedThisWord);
+        if (STATE.mode === 'helper') {
+            el.textContent = `budget left this word: ${rem}/${STATE.helperMaxPerWord}`;
+        } else {
+            el.textContent = `budget: -- (enable helper)`;
+        }
+    }
+
+    function setTab(tab) {
+        STATE.tab = tab;
+        saveSettings();
         const root = document.getElementById('ja3farr-menu');
-        if (root) root.classList.toggle('is-on', STATE.enabled);
-        const stateText = document.getElementById('ja3farr-state-text');
-        if (stateText) stateText.textContent = STATE.enabled ? 'active' : 'disabled';
+        if (root) {
+            root.querySelectorAll('.ja3farr-tab').forEach(el => {
+                el.classList.toggle('active', el.dataset.tab === tab);
+            });
+        }
+        renderPanel();
     }
 
     function setMenuHidden(hidden) {
@@ -419,9 +892,63 @@
         if (c) c.textContent = '\u00b7 ' + STATE.keysSent + ' keys';
     }
 
-    /* ----------------------------- boot ------------------------------ */
+    function renderState() {
+        const root = document.getElementById('ja3farr-menu');
+        if (!root) return;
+
+        // Tabs
+        root.querySelectorAll('.ja3farr-tab').forEach(el => {
+            el.classList.toggle('active', el.dataset.tab === STATE.tab);
+        });
+
+        // Toggle visual states
+        const switches = root.querySelectorAll('[data-toggle]');
+        switches.forEach(sw => {
+            const name = sw.dataset.toggle;
+            let on = false;
+            if (name === 'auto') on = STATE.mode === 'auto';
+            else if (name === 'humanize') on = STATE.humanize;
+            else if (name === 'manual-space') on = STATE.mode === 'manual-space';
+            else if (name === 'helper') on = STATE.mode === 'helper';
+            else if (name === 'full-auto') on = STATE.mode === 'full-auto';
+            else if (name === 'pauses') on = STATE.fullAutoNaturalPauses;
+            sw.classList.toggle('is-on', on);
+        });
+
+        // Inputs reflect state
+        const helperInput = root.querySelector('[data-input="helper-max"]');
+        if (helperInput) helperInput.value = STATE.helperMaxPerWord;
+        const wpmInput = root.querySelector('[data-input="wpm"]');
+        if (wpmInput) wpmInput.value = STATE.fullAutoWpm;
+        const mistakeInput = root.querySelector('[data-input="mistake"]');
+        if (mistakeInput) mistakeInput.value = STATE.fullAutoMistakeRate;
+
+        // Helper "n" label
+        const helperN = root.querySelector('#ja3farr-helper-n');
+        if (helperN) helperN.textContent = String(STATE.helperMaxPerWord);
+
+        // Menu-level on indicator (active dot)
+        const anyOn = STATE.mode !== 'off';
+        root.classList.toggle('is-on', anyOn);
+        const stateText = document.getElementById('ja3farr-state-text');
+        if (stateText) {
+            if (STATE.mode === 'off') stateText.textContent = 'disabled';
+            else if (STATE.mode === 'auto') stateText.textContent = 'auto';
+            else if (STATE.mode === 'manual-space') stateText.textContent = 'manual-space';
+            else if (STATE.mode === 'helper') stateText.textContent = 'helper';
+            else if (STATE.mode === 'full-auto') stateText.textContent = 'full auto @ ' + STATE.fullAutoWpm + ' wpm';
+        }
+
+        renderHelperRemaining();
+        updateCounter();
+    }
+
+    /* =============================================================
+       BOOT
+       ============================================================= */
     function boot() {
         if (document.getElementById('ja3farr-menu')) return;
+        loadSettings();
         injectStyle();
         buildMenu();
     }
