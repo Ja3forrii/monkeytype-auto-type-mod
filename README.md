@@ -55,7 +55,7 @@ You need a browser extension that can run userscripts. Pick one:
 
 Click the button below to install directly:
 
-> **[Click here to install monkeytype-auto-type.user.js](https://github.com/ja3farrdd0s/monkeytype-auto-type-mod/raw/main/monkeytype-auto-type.user.js)**
+> **[Click here to install monkeytype-auto-type.user.js](https://github.com/Ja3forrii/monkeytype-auto-type-mod/raw/main/monkeytype-auto-type.user.js)**
 
 Or manually:
 
